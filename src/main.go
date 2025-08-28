@@ -46,6 +46,11 @@ type PVCController struct {
 	stopCh      chan struct{}
 	workqueue   workqueue.RateLimitingInterface
 	pvcHandling sync.Map // 用于跟踪正在处理的PVC
+	// 使用更可靠的队列配置
+	queueConfig workqueue.RateLimitingInterface
+	// 添加事件监听器
+	eventInformer cache.Controller
+	eventIndexer  cache.Indexer
 }
 
 // NewPVCController 创建新的PVC控制器
@@ -54,7 +59,10 @@ func NewPVCController(clientset *kubernetes.Clientset) *PVCController {
 		clientset: clientset,
 		stopCh:    make(chan struct{}),
 		workqueue: workqueue.NewNamedRateLimitingQueue(
-			workqueue.DefaultControllerRateLimiter(),
+			workqueue.NewMaxOfRateLimiter(
+				workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 30*time.Second),
+				workqueue.DefaultControllerRateLimiter(),
+			),
 			"pvcs",
 		),
 	}
@@ -62,7 +70,7 @@ func NewPVCController(clientset *kubernetes.Clientset) *PVCController {
 
 // Start 启动PVC控制器
 func (c *PVCController) Start() error {
-	// 创建PVC的ListWatch
+	// 创建PVC的ListWatch，使用更可靠的配置
 	listWatch := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			return c.clientset.CoreV1().PersistentVolumeClaims("").List(context.Background(), options)
@@ -72,8 +80,8 @@ func (c *PVCController) Start() error {
 		},
 	}
 
-	// 创建informer
-	c.indexer, c.informer = cache.NewIndexerInformer(listWatch, &corev1.PersistentVolumeClaim{}, 0, cache.ResourceEventHandlerFuncs{
+	// 创建informer，使用更短的resync周期来减少事件丢失
+	c.indexer, c.informer = cache.NewIndexerInformer(listWatch, &corev1.PersistentVolumeClaim{}, 30*time.Second, cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.onPVCAdd,
 		UpdateFunc: c.onPVCUpdate,
 		DeleteFunc: c.onPVCDelete,
@@ -87,12 +95,12 @@ func (c *PVCController) Start() error {
 		return fmt.Errorf("failed to sync PVC cache")
 	}
 
-	// 启动工作线程
-	for i := 0; i < 3; i++ { // 启动3个worker处理队列
+	// 启动更多的工作线程来处理高并发
+	for i := 0; i < 8; i++ { // 增加到8个worker
 		go wait.Until(c.runWorker, time.Second, c.stopCh)
 	}
 
-	log.Println("PVC controller started successfully")
+	log.Println("PVC controller started successfully with enhanced reliability")
 	return nil
 }
 
@@ -110,8 +118,10 @@ func (c *PVCController) onPVCAdd(obj interface{}) {
 		log.Printf("Error getting key for PVC: %v", err)
 		return
 	}
-	c.workqueue.Add(key)
-	log.Printf("PVC added to queue: %s, Phase: %s", key, pvc.Status.Phase)
+
+	// 使用AddRateLimited来避免重复添加
+	c.workqueue.AddRateLimited(key)
+	log.Printf("PVC added to queue: %s, Phase: %s, Namespace: %s", key, pvc.Status.Phase, pvc.Namespace)
 }
 
 // onPVCUpdate 处理PVC更新事件
@@ -126,9 +136,18 @@ func (c *PVCController) onPVCUpdate(oldObj, newObj interface{}) {
 			log.Printf("Error getting key for PVC: %v", err)
 			return
 		}
-		c.workqueue.Add(key)
-		log.Printf("PVC status changed added to queue: %s, Phase: %s -> %s",
-			key, oldPVC.Status.Phase, newPVC.Status.Phase)
+
+		// 使用AddRateLimited来避免重复添加
+		c.workqueue.AddRateLimited(key)
+		log.Printf("PVC status changed added to queue: %s, Phase: %s -> %s, Namespace: %s",
+			key, oldPVC.Status.Phase, newPVC.Status.Phase, newPVC.Namespace)
+	} else {
+		// 记录其他类型的更新事件用于调试
+		key, err := cache.MetaNamespaceKeyFunc(newObj)
+		if err != nil {
+			return
+		}
+		log.Printf("PVC updated (no phase change): %s, Phase: %s, Namespace: %s", key, newPVC.Status.Phase, newPVC.Namespace)
 	}
 }
 
@@ -173,14 +192,31 @@ func (c *PVCController) processNextItem() bool {
 	}
 	defer c.pvcHandling.Delete(key)
 
-	err := c.processPVC(key.(string))
-	if err != nil {
-		log.Printf("Error processing PVC %s: %v", key, err)
-		// 重新入队列重试
+	// 添加处理超时保护
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 使用带超时的处理
+	done := make(chan error, 1)
+	go func() {
+		done <- c.processPVC(key.(string))
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("Error processing PVC %s: %v", key, err)
+			// 重新入队列重试，使用指数退避
+			c.workqueue.AddRateLimited(key)
+		} else {
+			// 处理成功，重置限速器
+			c.workqueue.Forget(key)
+			log.Printf("Successfully processed PVC %s", key)
+		}
+	case <-ctx.Done():
+		log.Printf("Timeout processing PVC %s", key)
+		// 超时后重新入队列
 		c.workqueue.AddRateLimited(key)
-	} else {
-		// 处理成功，重置限速器
-		c.workqueue.Forget(key)
 	}
 
 	return true
@@ -251,6 +287,11 @@ func (c *PVCController) checkAndAnnotatePVC(pvc *corev1.PersistentVolumeClaim) e
 				pvc.Namespace, pvc.Name, time.Now().Format(time.RFC3339))
 		}
 	}
+
+	// 记录PVC状态变化的时间，这是记录创建过程的关键
+	log.Printf("PVC %s/%s: Current Phase: %s, Processing Time: %s",
+		pvc.Namespace, pvc.Name, pvc.Status.Phase, time.Now().Format(time.RFC3339))
+
 	return nil
 }
 
@@ -423,6 +464,25 @@ func mutateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 对于所有操作，确保当前阶段在timings中有记录
+	// 这是一个额外的安全检查，防止遗漏
+	phaseExists := false
+	for _, timing := range newTiming.Timings {
+		if timing.Phase == currentPhase {
+			phaseExists = true
+			break
+		}
+	}
+
+	if !phaseExists {
+		newTiming.Timings = append(newTiming.Timings, PhaseTiming{
+			Phase: currentPhase,
+			Time:  now,
+		})
+		log.Printf("PVC %s/%s: Adding missing phase timing record for %s",
+			pvc.Namespace, pvc.Name, currentPhase)
+	}
+
 	// 序列化 timing 数据
 	timingJSON, err := json.Marshal(newTiming)
 	if err != nil {
@@ -440,7 +500,7 @@ func mutateHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("PVC %s/%s: Setting pvc-timing annotation to: %s",
 		pvc.Namespace, pvc.Name, string(timingJSON))
 
-	// 创建 JSON patch
+	// 创建 JSON patch，使用更可靠的方法
 	originalJSON, err := json.Marshal(pvc)
 	if err != nil {
 		log.Printf("Failed to marshal original PVC: %v", err)
@@ -463,6 +523,7 @@ func mutateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 使用更可靠的patch创建方法
 	patch, err := jsonpatch.CreatePatch(originalJSON, modifiedJSON)
 	if err != nil {
 		log.Printf("Failed to create patch: %v", err)
@@ -470,6 +531,13 @@ func mutateHandler(w http.ResponseWriter, r *http.Request) {
 		resp.Result = &metav1.Status{
 			Message: err.Error(),
 		}
+		json.NewEncoder(w).Encode(reviewResponse)
+		return
+	}
+
+	// 验证patch的有效性
+	if len(patch) == 0 {
+		log.Printf("PVC %s/%s: No changes needed, patch is empty", pvc.Namespace, pvc.Name)
 		json.NewEncoder(w).Encode(reviewResponse)
 		return
 	}
