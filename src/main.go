@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	jsonpatch "gomodules.xyz/jsonpatch/v2"
@@ -14,11 +15,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -36,11 +40,12 @@ type PVCTiming struct {
 
 // PVCController 定义PVC控制器结构体
 type PVCController struct {
-	clientset *kubernetes.Clientset
-	indexer   cache.Indexer
-	informer  cache.Controller
-	stopCh    chan struct{}
-	workqueue workqueue.RateLimitingInterface
+	clientset   *kubernetes.Clientset
+	indexer     cache.Indexer
+	informer    cache.Controller
+	stopCh      chan struct{}
+	workqueue   workqueue.RateLimitingInterface
+	pvcHandling sync.Map // 用于跟踪正在处理的PVC
 }
 
 // NewPVCController 创建新的PVC控制器
@@ -48,7 +53,10 @@ func NewPVCController(clientset *kubernetes.Clientset) *PVCController {
 	return &PVCController{
 		clientset: clientset,
 		stopCh:    make(chan struct{}),
-		workqueue: workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		workqueue: workqueue.NewNamedRateLimitingQueue(
+			workqueue.DefaultControllerRateLimiter(),
+			"pvcs",
+		),
 	}
 }
 
@@ -79,20 +87,31 @@ func (c *PVCController) Start() error {
 		return fmt.Errorf("failed to sync PVC cache")
 	}
 
+	// 启动工作线程
+	for i := 0; i < 3; i++ { // 启动3个worker处理队列
+		go wait.Until(c.runWorker, time.Second, c.stopCh)
+	}
+
 	log.Println("PVC controller started successfully")
 	return nil
 }
 
 // Stop 停止PVC控制器
 func (c *PVCController) Stop() {
+	c.workqueue.ShutDown()
 	close(c.stopCh)
 }
 
 // onPVCAdd 处理PVC添加事件
 func (c *PVCController) onPVCAdd(obj interface{}) {
 	pvc := obj.(*corev1.PersistentVolumeClaim)
-	log.Printf("PVC added: %s/%s, Phase: %s", pvc.Namespace, pvc.Name, pvc.Status.Phase)
-	c.checkAndAnnotatePVC(pvc)
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		log.Printf("Error getting key for PVC: %v", err)
+		return
+	}
+	c.workqueue.Add(key)
+	log.Printf("PVC added to queue: %s, Phase: %s", key, pvc.Status.Phase)
 }
 
 // onPVCUpdate 处理PVC更新事件
@@ -102,78 +121,137 @@ func (c *PVCController) onPVCUpdate(oldObj, newObj interface{}) {
 
 	// 检查状态是否发生变化
 	if oldPVC.Status.Phase != newPVC.Status.Phase {
-		log.Printf("PVC status changed: %s/%s, Phase: %s -> %s",
-			newPVC.Namespace, newPVC.Name, oldPVC.Status.Phase, newPVC.Status.Phase)
-		c.checkAndAnnotatePVC(newPVC)
+		key, err := cache.MetaNamespaceKeyFunc(newObj)
+		if err != nil {
+			log.Printf("Error getting key for PVC: %v", err)
+			return
+		}
+		c.workqueue.Add(key)
+		log.Printf("PVC status changed added to queue: %s, Phase: %s -> %s",
+			key, oldPVC.Status.Phase, newPVC.Status.Phase)
 	}
 }
 
 // onPVCDelete 处理PVC删除事件
 func (c *PVCController) onPVCDelete(obj interface{}) {
-	pvc := obj.(*corev1.PersistentVolumeClaim)
+	pvc, ok := obj.(*corev1.PersistentVolumeClaim)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			log.Printf("Error decoding object, invalid type")
+			return
+		}
+		pvc, ok = tombstone.Obj.(*corev1.PersistentVolumeClaim)
+		if !ok {
+			log.Printf("Error decoding tombstone object, invalid type")
+			return
+		}
+	}
 	log.Printf("PVC deleted: %s/%s", pvc.Namespace, pvc.Name)
 }
 
+// runWorker 处理工作队列中的项目
+func (c *PVCController) runWorker() {
+	for c.processNextItem() {
+	}
+}
+
+// processNextItem 处理下一个队列项目
+func (c *PVCController) processNextItem() bool {
+	key, quit := c.workqueue.Get()
+	if quit {
+		return false
+	}
+	defer c.workqueue.Done(key)
+
+	// 检查是否正在处理此PVC
+	if _, loaded := c.pvcHandling.LoadOrStore(key, true); loaded {
+		// 如果已经在处理，重新入队列稍后处理
+		c.workqueue.AddRateLimited(key)
+		log.Printf("PVC %s is already being processed, re-queuing", key)
+		return true
+	}
+	defer c.pvcHandling.Delete(key)
+
+	err := c.processPVC(key.(string))
+	if err != nil {
+		log.Printf("Error processing PVC %s: %v", key, err)
+		// 重新入队列重试
+		c.workqueue.AddRateLimited(key)
+	} else {
+		// 处理成功，重置限速器
+		c.workqueue.Forget(key)
+	}
+
+	return true
+}
+
+// processPVC 处理具体的PVC
+func (c *PVCController) processPVC(key string) error {
+	obj, exists, err := c.indexer.GetByKey(key)
+	if err != nil {
+		return fmt.Errorf("error fetching object with key %s from store: %v", key, err)
+	}
+
+	if !exists {
+		// PVC不存在，可能是被删除了
+		log.Printf("PVC %s does not exist anymore", key)
+		return nil
+	}
+
+	pvc := obj.(*corev1.PersistentVolumeClaim)
+	return c.checkAndAnnotatePVC(pvc)
+}
+
 // checkAndAnnotatePVC 检查PVC状态并在完成时添加注解
-func (c *PVCController) checkAndAnnotatePVC(pvc *corev1.PersistentVolumeClaim) {
+func (c *PVCController) checkAndAnnotatePVC(pvc *corev1.PersistentVolumeClaim) error {
 	// 检查PVC是否处于完成状态
 	if pvc.Status.Phase == corev1.ClaimBound {
 		// 检查是否已经有webhook-trigger注解
 		if _, exists := pvc.Annotations["webhook-trigger"]; !exists {
-			// 添加webhook-trigger注解
-			timestamp := fmt.Sprintf("%d", time.Now().Unix())
+			// 使用重试机制处理可能的冲突
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				// 获取最新的PVC对象
+				latestPVC, err := c.clientset.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(
+					context.Background(), pvc.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
 
-			// 创建patch来添加注解
-			patch := fmt.Sprintf(`[{"op":"add","path":"/metadata/annotations/webhook-trigger","value":"%s"}]`, timestamp)
+				// 再次检查注解
+				if _, exists := latestPVC.Annotations["webhook-trigger"]; exists {
+					return nil // 注解已存在，无需处理
+				}
 
-			// 应用patch
-			_, err := c.clientset.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(
-				context.Background(),
-				pvc.Name,
-				"application/json-patch+json",
-				[]byte(patch),
-				metav1.PatchOptions{},
-			)
+				// 添加webhook-trigger注解
+				timestamp := fmt.Sprintf("%d", time.Now().Unix())
+
+				// 创建patch来添加注解
+				patch := []byte(fmt.Sprintf(
+					`[{"op":"add","path":"/metadata/annotations/webhook-trigger","value":"%s"}]`,
+					timestamp))
+
+				// 应用patch
+				_, err = c.clientset.CoreV1().PersistentVolumeClaims(pvc.Namespace).Patch(
+					context.Background(),
+					pvc.Name,
+					types.JSONPatchType,
+					patch,
+					metav1.PatchOptions{},
+				)
+				return err
+			})
 
 			if err != nil {
-				log.Printf("Failed to add webhook-trigger annotation to PVC %s/%s: %v",
+				return fmt.Errorf("failed to add webhook-trigger annotation to PVC %s/%s: %v",
 					pvc.Namespace, pvc.Name, err)
-			} else {
-				log.Printf("Successfully added webhook-trigger annotation to PVC %s/%s: %s",
-					pvc.Namespace, pvc.Name, timestamp)
 			}
+
+			log.Printf("Successfully added webhook-trigger annotation to PVC %s/%s: %s",
+				pvc.Namespace, pvc.Name, time.Now().Format(time.RFC3339))
 		}
 	}
-}
-
-func main() {
-	TLS_CERT_FILE := os.Getenv("TLS_CERT_FILE")
-	TLS_KEY_FILE := os.Getenv("TLS_KEY_FILE")
-
-	if TLS_CERT_FILE == "" || TLS_KEY_FILE == "" {
-		log.Fatal("TLS_CERT_FILE and TLS_KEY_FILE must be set")
-		os.Exit(1)
-	}
-
-	// 创建Kubernetes客户端
-	clientset, err := createKubernetesClient()
-	if err != nil {
-		log.Fatalf("Failed to create Kubernetes client: %v", err)
-	}
-
-	// 创建并启动PVC控制器
-	pvcController := NewPVCController(clientset)
-	if err := pvcController.Start(); err != nil {
-		log.Fatalf("Failed to start PVC controller: %v", err)
-	}
-	defer pvcController.Stop()
-
-	http.HandleFunc("/mutate", mutateHandler)
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	log.Println("Starting PVC Mutating Webhook on :8080")
-	log.Fatal(http.ListenAndServeTLS(":8080", TLS_CERT_FILE, TLS_KEY_FILE, nil))
+	return nil
 }
 
 // createKubernetesClient 创建Kubernetes客户端
@@ -415,4 +493,33 @@ func mutateHandler(w http.ResponseWriter, r *http.Request) {
 	resp.PatchType = &patchType
 
 	json.NewEncoder(w).Encode(reviewResponse)
+}
+
+func main() {
+	TLS_CERT_FILE := os.Getenv("TLS_CERT_FILE")
+	TLS_KEY_FILE := os.Getenv("TLS_KEY_FILE")
+
+	if TLS_CERT_FILE == "" || TLS_KEY_FILE == "" {
+		log.Fatal("TLS_CERT_FILE and TLS_KEY_FILE must be set")
+	}
+
+	// 创建Kubernetes客户端
+	clientset, err := createKubernetesClient()
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes client: %v", err)
+	}
+
+	// 创建并启动PVC控制器
+	pvcController := NewPVCController(clientset)
+	if err := pvcController.Start(); err != nil {
+		log.Fatalf("Failed to start PVC controller: %v", err)
+	}
+	defer pvcController.Stop()
+
+	http.HandleFunc("/mutate", mutateHandler)
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	log.Println("Starting PVC Mutating Webhook on :8080")
+	log.Fatal(http.ListenAndServeTLS(":8080", TLS_CERT_FILE, TLS_KEY_FILE, nil))
 }
